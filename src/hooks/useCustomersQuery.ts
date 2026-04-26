@@ -49,6 +49,7 @@ export function useCustomersQuery(
     params.sortKey,
     params.sortDir,
     params.status,
+    params.refreshKey,
   ]);
 
   return { result, loading, error };

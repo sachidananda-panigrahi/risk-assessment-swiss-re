@@ -1,87 +1,109 @@
-import { generateCustomers } from "../data/customers";
 import type { Customer } from "../data/customers";
-
-// Singleton dataset — generated once, shared across all API calls
-const ALL_DATA: Customer[] = generateCustomers(20000);
 
 export type SortKey = "name" | "company" | "country" | "status" | "createdAt";
 export type SortDir = "asc" | "desc";
 export type StatusFilter = "all" | "Active" | "Inactive";
 
 export interface CustomerQueryParams {
-  page: number;        // 1-based
+  page: number;
   pageSize: number;
   search?: string;
   sortKey?: SortKey;
   sortDir?: SortDir;
   status?: StatusFilter;
+  refreshKey?: number;
 }
 
 export interface CustomerQueryResult {
   data: Customer[];
-  total: number;        // filtered total
+  total: number;
   page: number;
   pageSize: number;
   totalPages: number;
-  grandTotal: number;   // unfiltered total (for header badge)
+  grandTotal: number;
 }
 
-/**
- * Mock API — simulates server-side filter + sort + paginate.
- * Adds 80–160 ms latency to mimic real network round-trip.
- */
-export async function queryCustomers(
-  params: CustomerQueryParams
-): Promise<CustomerQueryResult> {
-  // Simulate network latency
-  const latency = 80 + Math.random() * 80;
-  await new Promise((resolve) => setTimeout(resolve, latency));
+type QueryPayload = Omit<CustomerQueryParams, "refreshKey"> & {
+  search: string;
+  sortKey: SortKey;
+  sortDir: SortDir;
+  status: StatusFilter;
+};
 
-  const {
-    page,
-    pageSize,
-    search = "",
-    sortKey = "createdAt",
-    sortDir = "desc",
-    status = "all",
-  } = params;
+type CreatePayload = { customer: Omit<Customer, "id" | "avatarColor" | "avatarInitials" | "createdAt"> };
 
-  // 1. Filter by status
-  let rows = status === "all" ? ALL_DATA : ALL_DATA.filter((c) => c.status === status);
+type UpdatePayload = { id: string; updates: Partial<Omit<Customer, "id" | "avatarColor" | "avatarInitials" | "createdAt">> };
 
-  // 2. Filter by search
-  if (search.trim()) {
-    const q = search.trim().toLowerCase();
-    rows = rows.filter(
-      (c) =>
-        c.name.toLowerCase().includes(q) ||
-        c.email.toLowerCase().includes(q) ||
-        c.company.toLowerCase().includes(q) ||
-        c.country.toLowerCase().includes(q)
-    );
+type DeletePayload = { id: string };
+
+interface WorkerRequest {
+  requestId: number;
+  type: "QUERY" | "CREATE" | "UPDATE" | "DELETE";
+  payload: QueryPayload | CreatePayload | UpdatePayload | DeletePayload;
+}
+
+interface WorkerResponse {
+  requestId: number;
+  status: "success" | "error";
+  result?: any;
+  error?: string;
+}
+
+const worker = new Worker(new URL("../workers/dataWorker.ts", import.meta.url), { type: "module" });
+
+const pending = new Map<number, {
+  resolve: (value: any) => void;
+  reject: (reason?: unknown) => void;
+}>();
+let nextRequestId = 1;
+
+worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+  const { requestId, status, result, error } = event.data;
+  const entry = pending.get(requestId);
+  if (!entry) return;
+
+  pending.delete(requestId);
+  if (status === "success") {
+    entry.resolve(result);
+  } else {
+    entry.reject(new Error(error ?? "Worker request failed"));
   }
+};
 
-  // 3. Sort
-  rows = [...rows].sort((a, b) => {
-    const av = (a[sortKey] as string).toLowerCase();
-    const bv = (b[sortKey] as string).toLowerCase();
-    const cmp = av < bv ? -1 : av > bv ? 1 : 0;
-    return sortDir === "asc" ? cmp : -cmp;
+function postWorkerMessage<T extends WorkerRequest>(message: Omit<T, "requestId">): Promise<any> {
+  const requestId = nextRequestId++;
+  return new Promise((resolve, reject) => {
+    pending.set(requestId, { resolve, reject });
+    worker.postMessage({ ...message, requestId });
   });
+}
 
-  // 4. Paginate
-  const total = rows.length;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const clampedPage = Math.max(1, Math.min(page, totalPages));
-  const start = (clampedPage - 1) * pageSize;
-  const data = rows.slice(start, start + pageSize);
-
-  return {
-    data,
-    total,
-    page: clampedPage,
-    pageSize,
-    totalPages,
-    grandTotal: ALL_DATA.length,
+export async function queryCustomers(params: CustomerQueryParams): Promise<CustomerQueryResult> {
+  const payload: QueryPayload = {
+    page: params.page,
+    pageSize: params.pageSize,
+    search: params.search ?? "",
+    sortKey: params.sortKey ?? "createdAt",
+    sortDir: params.sortDir ?? "desc",
+    status: params.status ?? "all",
   };
+
+  return postWorkerMessage({ type: "QUERY", payload });
+}
+
+export async function createCustomer(
+  customer: Omit<Customer, "id" | "avatarColor" | "avatarInitials" | "createdAt">
+): Promise<Customer> {
+  return postWorkerMessage({ type: "CREATE", payload: { customer } });
+}
+
+export async function updateCustomer(
+  id: string,
+  updates: Partial<Omit<Customer, "id" | "avatarColor" | "avatarInitials" | "createdAt">>
+): Promise<Customer> {
+  return postWorkerMessage({ type: "UPDATE", payload: { id, updates } });
+}
+
+export async function deleteCustomer(id: string): Promise<void> {
+  return postWorkerMessage({ type: "DELETE", payload: { id } });
 }
